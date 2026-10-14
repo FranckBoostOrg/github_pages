@@ -1,0 +1,104 @@
+# Publish one page per branch on the repository's GitHub Pages site.
+#
+#   https://<owner>.github.io/<repo>/            -> index linking every branch
+#   https://<owner>.github.io/<repo>/<branch>/   -> the single .html file at the root of <branch>
+#
+# A repository has only one Pages site, so every run rebuilds the whole site from
+# all branches and deploys it. A push to any branch refreshes that branch's page;
+# deleting a branch removes it.
+#
+# Note: a push only triggers this workflow if the pushed branch contains this file,
+# which is the case for any branch created from main.
+#
+# One-time repository setup:
+#   - Settings > Pages > Source: "GitHub Actions" (build_type=workflow)
+#   - Settings > Environments > github-pages: allow deployments from all branches
+name: Branch pages
+
+on:
+  push:
+    branches-ignore: [gh-pages]
+  delete:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch all branches
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          TOKEN: ${{ github.token }}
+        run: |
+          git init --quiet repo
+          cd repo
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)" \
+            fetch --quiet --no-tags --depth=1 "$REPO_URL" '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Assemble site
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
+          site="$PWD/_site"
+          mkdir -p "$site"
+          cd repo
+
+          deployed=()
+          while IFS= read -r branch; do
+            [ "$branch" = gh-pages ] && continue
+            ref="refs/remotes/origin/$branch"
+            mapfile -t html < <(git ls-tree --name-only "$ref" | grep -iE '\.html?$' || true)
+            if [ ${#html[@]} -eq 0 ]; then
+              echo "::notice::$branch: no .html file at root, skipped"
+              continue
+            fi
+            file="${html[0]}"
+            for f in "${html[@]}"; do [ "${f,,}" = index.html ] && file="$f"; done
+            [ ${#html[@]} -gt 1 ] && echo "::warning::$branch: ${#html[@]} html files found, using $file"
+            mkdir -p "$site/$branch"
+            git show "$ref:$file" > "$site/$branch/index.html"
+            deployed+=("$branch")
+            echo "$branch: $file -> /$branch/"
+          done < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin)
+
+          {
+            echo '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Branches</title></head><body>'
+            echo "<h1>$REPO — branch previews</h1><ul>"
+            for b in "${deployed[@]}"; do
+              e="$(printf '%s' "$b" | html_escape)"
+              echo "  <li><a href=\"./$e/\">$e</a></li>"
+            done
+            echo '</ul></body></html>'
+          } > "$site/index.html"
+
+          {
+            echo "### Deployed branches"
+            for b in "${deployed[@]}"; do echo "- \`$b\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
